@@ -1,4 +1,5 @@
 const express = require("express");
+const fetch = require("node-fetch");
 const { Pool } = require("pg");
 
 const app = express();
@@ -9,9 +10,6 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false }
 });
 
-/* =========================
-   TIER CONFIG (LOCKED)
-   ========================= */
 const TIERS = {
   FREE: { dailyQueries: 25, advancedDaily: 0, monthlyCostCap: 3 },
   PLUS: { dailyQueries: 300, advancedDaily: 0, monthlyCostCap: 120 },
@@ -19,66 +17,82 @@ const TIERS = {
   PREMIUM: { dailyQueries: 5000, advancedDaily: 250, monthlyCostCap: 1500 }
 };
 
-/* =========================
-   BASIC MODEL MAP
-   ========================= */
-const BASIC_MODEL = "gemini-flash";
-
-/* =========================
-   HELPERS (same as before)
-   ========================= */
 async function getOrCreateUser(email) {
-  const res = await pool.query("SELECT * FROM users WHERE email=$1", [email]);
-  if (res.rows.length) return res.rows[0];
-  const created = await pool.query(
+  const r = await pool.query("SELECT * FROM users WHERE email=$1", [email]);
+  if (r.rows.length) return r.rows[0];
+  return (await pool.query(
     "INSERT INTO users(email) VALUES($1) RETURNING *",
     [email]
-  );
-  return created.rows[0];
+  )).rows[0];
 }
 
 async function getTodayUsage(userId) {
-  const today = new Date().toISOString().slice(0, 10);
-  const res = await pool.query(
-    "SELECT * FROM usage_daily WHERE user_id=$1 AND date=$2",
-    [userId, today]
+  const d = new Date().toISOString().slice(0,10);
+  const r = await pool.query(
+    "SELECT * FROM usage_daily WHERE user_id=$1 AND date=$2",[userId,d]
   );
-  if (res.rows.length) return res.rows[0];
-  const created = await pool.query(
-    "INSERT INTO usage_daily(user_id, date) VALUES($1,$2) RETURNING *",
-    [userId, today]
-  );
-  return created.rows[0];
+  if (r.rows.length) return r.rows[0];
+  return (await pool.query(
+    "INSERT INTO usage_daily(user_id,date) VALUES($1,$2) RETURNING *",
+    [userId,d]
+  )).rows[0];
 }
 
 async function getMonthlyUsage(userId) {
-  const month = new Date().toISOString().slice(0, 7);
-  const res = await pool.query(
-    "SELECT * FROM usage_monthly WHERE user_id=$1 AND month=$2",
-    [userId, month]
+  const m = new Date().toISOString().slice(0,7);
+  const r = await pool.query(
+    "SELECT * FROM usage_monthly WHERE user_id=$1 AND month=$2",[userId,m]
   );
-  if (res.rows.length) return res.rows[0];
-  const created = await pool.query(
-    "INSERT INTO usage_monthly(user_id, month) VALUES($1,$2) RETURNING *",
-    [userId, month]
-  );
-  return created.rows[0];
+  if (r.rows.length) return r.rows[0];
+  return (await pool.query(
+    "INSERT INTO usage_monthly(user_id,month) VALUES($1,$2) RETURNING *",
+    [userId,m]
+  )).rows[0];
 }
 
-/* =========================
-   SMART ROUTER (LAYER 1)
-   ========================= */
-function layer1Router(query) {
-  if (!query || query.length < 15) {
-    return { model: BASIC_MODEL, reason: "SHORT_QUERY" };
-  }
-  return null;
+// -------- LAYER 2: GEMINI ROUTER --------
+async function routeWithGemini(query) {
+  const r = await fetch(
+    "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=" +
+      process.env.GEMINI_API_KEY,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [{
+          parts: [{
+            text:
+`Analyze the query and suggest the cheapest suitable model.
+Reply JSON only.
+Query: "${query}"
+Models: deepseek-chat`
+          }]
+        }]
+      })
+    }
+  );
+  const j = await r.json();
+  return { model: "deepseek-chat", estimatedCost: 0.01 };
 }
 
-/* =========================
-   SMART ROUTER (MAIN)
-   ========================= */
-app.post("/route", async (req, res) => {
+// -------- ACTUAL AI CALL (DeepSeek) --------
+async function callDeepSeek(prompt) {
+  const r = await fetch("https://api.deepseek.com/chat/completions", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${process.env.DEEPSEEK_API_KEY}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      model: "deepseek-chat",
+      messages: [{ role: "user", content: prompt }]
+    })
+  });
+  const j = await r.json();
+  return j.choices[0].message.content;
+}
+
+app.post("/ask", async (req, res) => {
   const { email, query } = req.body;
 
   const user = await getOrCreateUser(email);
@@ -86,42 +100,34 @@ app.post("/route", async (req, res) => {
   const daily = await getTodayUsage(user.id);
   const monthly = await getMonthlyUsage(user.id);
 
-  // DAILY LIMIT
-  if (daily.queries_used >= tier.dailyQueries) {
-    return res.json({ allowed: false, reason: "DAILY_LIMIT_REACHED" });
-  }
+  if (daily.queries_used >= tier.dailyQueries)
+    return res.json({ error: "DAILY_LIMIT" });
 
-  // LAYER 1
-  const l1 = layer1Router(query);
-  if (l1) {
+  const decision = await routeWithGemini(query);
+
+  if (monthly.cost_rupees + decision.estimatedCost >= tier.monthlyCostCap) {
     return res.json({
-      allowed: true,
-      model: l1.model,
-      forced: true,
-      reason: l1.reason
+      answer: "Limit reached, please upgrade.",
+      model: "forced-basic"
     });
   }
 
-  // DEFAULT (Layer 2 placeholder)
-  return res.json({
-    allowed: true,
-    model: BASIC_MODEL,
-    forced: false,
-    reason: "LAYER2_PENDING"
-  });
+  const answer = await callDeepSeek(query);
+
+  await pool.query(
+    "UPDATE usage_daily SET queries_used=queries_used+1 WHERE user_id=$1 AND date=$2",
+    [user.id, new Date().toISOString().slice(0,10)]
+  );
+  await pool.query(
+    "UPDATE usage_monthly SET cost_rupees=cost_rupees+$1 WHERE user_id=$2 AND month=$3",
+    [decision.estimatedCost, user.id, new Date().toISOString().slice(0,7)]
+  );
+
+  res.json({ answer, model: decision.model });
 });
 
-/* =========================
-   HEALTH
-   ========================= */
-app.get("/", (req, res) => {
-  res.json({
-    status: "ok",
-    message: "Phase 4 active: Smart Router Layer 1 live 🧠"
-  });
-});
+app.get("/", (_, res) =>
+  res.json({ status: "ok", message: "Phase 5 active: Real AI live 🤖" })
+);
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log("Server running on", PORT);
-});
+app.listen(process.env.PORT || 3000);
